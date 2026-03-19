@@ -22,12 +22,12 @@ that things in general were settled for ever.
 `.trim();
 
 async function testStory() {
-  console.log('\n=== STORY MODE (5 scenes, full pipeline) ===\n');
+  console.log('\n=== STORY MODE (5 scenes — thriller + king_like) ===\n');
   const result = await pipeline.run('story', TEST_PREMISE, {
-    style: 'noir',
-    tone: 'tense',
     scenes: 5,
-    protagonist: 'protagonist', // uses voiceProfiles.protagonist
+    genre: 'thriller',
+    authorStyle: 'king_like',
+    protagonist: 'protagonist',
   });
 
   if (result.scenes) {

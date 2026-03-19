@@ -21,6 +21,8 @@ const SOFT_CONSTRAINTS = [
  * Returns a formatted block ready to inject into any prompt.
  * Hard constraints are listed as absolutes.
  * Soft constraints are listed as preferences.
+ * Genre hard constraints merge in — they are non-negotiable.
+ * Style guidelines merge into soft constraints.
  */
 function buildConstraintBlock(extraHard = [], extraSoft = []) {
   const hard = [...HARD_CONSTRAINTS, ...extraHard];

@@ -78,4 +78,19 @@ function describeEmotion(state) {
   return `The protagonist is experiencing: ${parts.join(', ')}. Reflect this in tone, pacing, and internal dialogue.`;
 }
 
-module.exports = { updateEmotion, validateEmotionState, describeEmotion, emptyEmotionState };
+/**
+ * Apply genre bias to the initial emotion state.
+ * Call this once at story start — not per scene.
+ * Ensures the story feels like its genre from page one.
+ */
+function applyGenreBias(state, genreBias = {}) {
+  const next = { ...state.protagonist };
+  for (const [emotion, delta] of Object.entries(genreBias)) {
+    if (next[emotion] !== undefined) {
+      next[emotion] = clamp(next[emotion] + delta);
+    }
+  }
+  return { ...state, protagonist: next };
+}
+
+module.exports = { updateEmotion, validateEmotionState, describeEmotion, emptyEmotionState, applyGenreBias };
