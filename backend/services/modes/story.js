@@ -1,4 +1,4 @@
-// Story mode — style + narrative controls, multi-scene with continuity + variation + emotion + memory
+// Story mode — full pipeline: variation + emotion + memory + voice + scene validation
 const { PromptTemplate } = require('@langchain/core/prompts');
 const { LLMChain } = require('langchain/chains');
 const { llm } = require('../core/llm');
@@ -7,6 +7,8 @@ const { getVariation } = require('../agents/styleVariance');
 const { buildConstraintBlock } = require('../../utils/constraints');
 const { updateEmotion, describeEmotion, emptyEmotionState } = require('../../utils/emotionState');
 const { ContextWindow } = require('../core/memoryCompressor');
+const { getVoiceBlock } = require('../../characters/voiceProfiles');
+const { generateAndValidate } = require('../agents/sceneValidator');
 const fs = require('fs');
 const path = require('path');
 
@@ -23,6 +25,8 @@ Scene number: {sceneNum} of {totalScenes}
 
 {constraints}
 
+{voice}
+
 Scene direction: {variation}
 
 Emotional state: {emotion}
@@ -36,18 +40,19 @@ Write scene {sceneNum}:
 });
 
 async function run(input, options = {}) {
-  const { style = 'literary', tone = 'neutral', scenes = 1 } = options;
+  const { style = 'literary', tone = 'neutral', scenes = 1, protagonist = null } = options;
   const constraints = buildConstraintBlock();
+  const voice = getVoiceBlock(protagonist);
 
   if (scenes === 1) {
     const variation = getVariation(0);
     const emotion = describeEmotion(emptyEmotionState());
-    const { text } = await sceneChain.call({
+    const callArgs = {
       style, tone, sceneNum: 1, totalScenes: 1,
-      context: 'None yet.', input, constraints,
-      variation: variation.instruction,
-      emotion,
-    });
+      context: 'None yet.', input, constraints, voice,
+      variation: variation.instruction, emotion,
+    };
+    const { text } = await generateAndValidate(sceneChain, callArgs, variation.label);
     return text;
   }
 
@@ -61,13 +66,13 @@ async function run(input, options = {}) {
     const emotion = describeEmotion(emotionState);
     const context = memory.render();
 
-    const { text } = await sceneChain.call({
+    const callArgs = {
       style, tone, sceneNum: i, totalScenes: scenes,
-      context, input, constraints,
-      variation: variation.instruction,
-      emotion,
-    });
+      context, input, constraints, voice,
+      variation: variation.instruction, emotion,
+    };
 
+    const { text } = await generateAndValidate(sceneChain, callArgs, variation.label);
     rawScenes.push(text);
     await memory.add(text);
   }

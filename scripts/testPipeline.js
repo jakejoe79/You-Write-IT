@@ -22,11 +22,12 @@ that things in general were settled for ever.
 `.trim();
 
 async function testStory() {
-  console.log('\n=== STORY MODE (5 scenes, continuity + emotion + memory) ===\n');
+  console.log('\n=== STORY MODE (5 scenes, full pipeline) ===\n');
   const result = await pipeline.run('story', TEST_PREMISE, {
     style: 'noir',
     tone: 'tense',
     scenes: 5,
+    protagonist: 'protagonist', // uses voiceProfiles.protagonist
   });
 
   if (result.scenes) {
@@ -43,16 +44,27 @@ async function testStory() {
 }
 
 async function testAbridged() {
-  console.log('\n=== ABRIDGED MODE (Dickens, middle_school level) ===\n');
-  const result = await pipeline.run('abridged', GUTENBERG_SAMPLE, {
-    chunkSize: 400,
-    reading_level: 'middle_school',
+  console.log('\n=== ABRIDGED MODE — adult ===\n');
+  const adult = await pipeline.run('abridged', GUTENBERG_SAMPLE, {
+    chunkSize: 400, reading_level: 'adult', chapterHooks: true,
   });
-  console.log(result.text || result);
+  console.log(adult.text || adult);
+
+  console.log('\n=== ABRIDGED MODE — middle_school ===\n');
+  const ms = await pipeline.run('abridged', GUTENBERG_SAMPLE, {
+    chunkSize: 400, reading_level: 'middle_school', chapterHooks: true,
+  });
+  console.log(ms.text || ms);
+
+  console.log('\n=== ABRIDGED MODE — ESL ===\n');
+  const esl = await pipeline.run('abridged', GUTENBERG_SAMPLE, {
+    chunkSize: 400, reading_level: 'esl', chapterHooks: true,
+  });
+  console.log(esl.text || esl);
 }
 
 async function testAdventure() {
-  console.log('\n=== ADVENTURE MODE (3 branches, state + emotion tracking) ===\n');
+  console.log('\n=== ADVENTURE MODE (3 branches, state + emotion) ===\n');
   const result = await pipeline.run('adventure', TEST_PREMISE, {
     branches: 3,
     initialState: {

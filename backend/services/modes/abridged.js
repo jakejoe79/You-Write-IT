@@ -54,6 +54,23 @@ Passage to summarize:
   `.trim()),
 });
 
+// Chapter hook — closing line that pulls the reader forward
+const hookChain = new LLMChain({
+  llm,
+  prompt: PromptTemplate.fromTemplate(`
+You are writing the final line of a chapter in an abridged book.
+It should make the reader want to turn the page immediately.
+Do NOT summarize. Do NOT resolve. Create forward momentum.
+
+Reader level: {levelGuidance}
+Tone: {tone}
+What just happened in this chapter:
+{summary}
+
+Write ONE compelling closing line only. No explanation.
+  `.trim()),
+});
+
 const smoothChain = new LLMChain({
   llm,
   prompt: PromptTemplate.fromTemplate(`
@@ -79,7 +96,7 @@ function parseThreads(raw) {
 }
 
 async function run(input, options = {}) {
-  const { chunkSize = 2000, reading_level = 'adult' } = options;
+  const { chunkSize = 2000, reading_level = 'adult', chapterHooks = true } = options;
   const levelGuidance = READING_LEVELS[reading_level] || READING_LEVELS.adult;
   const chunks = chunk(input, chunkSize);
 
@@ -98,7 +115,20 @@ async function run(input, options = {}) {
       passage, prevSummary, characters, themes, tone, levelGuidance,
       key_events: key_events.join('; ') || 'None yet.',
     });
-    summaries.push(text);
+
+    let chapterText = text;
+
+    // Add a chapter hook to every chunk except the last
+    if (chapterHooks && summaries.length < chunks.length - 1) {
+      const { text: hook } = await hookChain.call({
+        summary: text.slice(0, 500),
+        tone,
+        levelGuidance,
+      });
+      chapterText = `${text.trim()}\n\n${hook.trim()}`;
+    }
+
+    summaries.push(chapterText);
     prevSummary = text.slice(0, 400);
     key_events.push(`[chunk ${summaries.length}] ${text.slice(0, 120)}...`);
   }
