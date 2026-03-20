@@ -3,17 +3,19 @@ const router = express.Router();
 const { getGenre } = require('../config/genreProfiles');
 const { getStyleGuidelines } = require('../config/styleMapper');
 const { getVariation } = require('../services/agents/styleVariance');
-const { buildConstraintBlock, checkHardViolations } = require('../utils/constraints');
+const { buildConstraintBlock, checkHardViolations, validateEdit } = require('../utils/constraints');
 const { updateEmotion, describeEmotion, emptyEmotionState, applyGenreBias } = require('../utils/emotionState');
 const { ContextWindow } = require('../services/core/memoryCompressor');
 const { getVoiceBlock } = require('../characters/voiceProfiles');
 const { generateAndValidate } = require('../services/agents/sceneValidator');
 const { checkContinuity } = require('../services/agents/continuity');
-const { createSession, addScene, updateSessionState, getSession, getScenes, updateSceneContent } = require('../db/sqlite');
+const { createSession, addScene, updateSessionState, getSession, getScenes, updateSceneContent, getChapter, getChapterState, getChapterId, addRevision, getChapters } = require('../db/sqlite');
 const { LLMChain } = require('langchain/chains');
 const { PromptTemplate } = require('@langchain/core/prompts');
 const { llm } = require('../services/core/llm');
 const { chunk } = require('../utils/chunker');
+const { SSEManager, generateEventId } = require('../services/core/sseManager');
+const ChapterAccumulator = require('../utils/chapterAccumulator');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -109,9 +111,9 @@ function parseThreads(raw) {
   } catch { return null; }
 }
 
-// POST /api/stream/story — streams scenes as SSE with session persistence
+// POST /api/stream/story — streams chapters as SSE with chapter accumulation
 router.post('/story', async (req, res) => {
-  const { input, scenes = 3, genre = null, authorStyle = null, protagonist = null, sessionId = null } = req.body;
+  const { input, chapters = 5, genre = null, authorStyle = null, protagonist = null, sessionId = null, resumeFrom = null } = req.body;
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -120,6 +122,15 @@ router.post('/story', async (req, res) => {
   res.flushHeaders();
 
   try {
+    // Check for resume
+    let startChapter = 0;
+    if (resumeFrom && sessionId) {
+      const position = await SSEManager.getResumePosition(sessionId);
+      if (position && position.fromIndex > 0) {
+        startChapter = position.fromIndex;
+      }
+    }
+
     const id = sessionId || await createSession({
       mode: 'story', title: input?.slice(0, 50), genre, authorStyle, protagonist,
       state: { characters: {}, inventory: [], choices_made: [], world_rules: [] },
@@ -132,42 +143,81 @@ router.post('/story', async (req, res) => {
     const voice = getVoiceBlock(protagonist);
     const memory = new ContextWindow({ rawWindow: 3 });
     let emotionState = applyGenreBias(emptyEmotionState(), genreProfile.emotionBias || {});
-    const rawScenes = [];
+    const rawChapters = [];
 
-    send(res, 'start', { sessionId: id, total: scenes });
+    // Chapter accumulator: buffer chunks until ~3000-5000 words
+    const chapterAccumulator = new ChapterAccumulator({ minWords: 3000, maxWords: 5000 });
 
-    for (let i = 1; i <= scenes; i++) {
-      const variation = getVariation(i - 1);
+    await SSEManager.setStreaming(id, true);
+    send(res, 'start', { sessionId: id, total: chapters, resumeFrom: startChapter > 0 ? startChapter : null });
+
+    for (let chapterNum = startChapter; chapterNum < chapters; chapterNum++) {
+      const variation = getVariation(chapterNum);
       emotionState = updateEmotion(emotionState, variation.label);
       const emotion = describeEmotion(emotionState);
       const context = memory.render();
 
-      send(res, 'progress', { scene: i, total: scenes, status: 'generating' });
+      send(res, 'progress', { chapter: chapterNum + 1, total: chapters, status: 'generating' });
 
+      // Generate scene content that feeds into chapter accumulator
       const { text, validation } = await generateAndValidate(sceneChain, {
-        sceneNum: i, totalScenes: scenes, context, input,
+        sceneNum: chapterNum + 1, totalScenes: chapters, context, input,
         constraints, voice, genreRules, styleGuidelines,
         variation: variation.instruction, emotion,
       }, variation.label);
 
-      rawScenes.push(text);
-      await memory.add(text);
-      await addScene(id, i, text, emotionState, validation);
-      send(res, 'scene', { index: i, text, validation, emotion: emotionState });
+      // Add to chapter accumulator
+      const chapter = chapterAccumulator.addChunk(text);
+
+      if (chapter) {
+        // Chapter complete - emit and persist
+        rawChapters.push(chapter.content);
+        await memory.add(chapter.content);
+        await addScene(id, chapter.index, chapter.content, emotionState, validation);
+        
+        // Send chapter with idempotency tracking
+        await SSEManager.sendEvent(res, id, 'chapter', { 
+          index: chapter.index, 
+          content: chapter.content, 
+          wordCount: chapter.wordCount,
+          validation, 
+          emotion: emotionState 
+        }, chapter.index);
+      }
+    }
+
+    // Flush any remaining content as final chapter
+    const finalChapter = chapterAccumulator.forceFlush();
+    if (finalChapter && finalChapter.wordCount > 0) {
+      rawChapters.push(finalChapter.content);
+      await memory.add(finalChapter.content);
+      await addScene(id, finalChapter.index, finalChapter.content, emotionState, '');
+      
+      await SSEManager.sendEvent(res, id, 'chapter', { 
+        index: finalChapter.index, 
+        content: finalChapter.content, 
+        wordCount: finalChapter.wordCount,
+        emotion: emotionState 
+      }, finalChapter.index);
     }
 
     send(res, 'progress', { status: 'checking continuity' });
-    const { corrected, report } = await checkContinuity(rawScenes);
+    const { corrected, report } = await checkContinuity(rawChapters);
     await updateSessionState(id, { protagonist: emotionState.protagonist });
 
-    send(res, 'done', { sessionId: id, scenes: corrected, continuityReport: report });
-  } catch (err) { send(res, 'error', { message: err.message }); }
-  finally { res.end(); }
+    await SSEManager.setStreaming(id, false);
+    send(res, 'done', { sessionId: id, chapters: rawChapters, continuityReport: report });
+  } catch (err) { 
+    send(res, 'error', { message: err.message }); 
+  }
+  finally { 
+    res.end(); 
+  }
 });
 
 // POST /api/stream/abridge — streams abridged chunks as SSE
 router.post('/abridge', async (req, res) => {
-  const { input, chunkSize = 2000, reading_level = 'adult', chapterHooks = true, sessionId = null } = req.body;
+  const { input, chunkSize = 2000, reading_level = 'adult', chapterHooks = true, sessionId = null, resumeFrom = null } = req.body;
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -176,6 +226,15 @@ router.post('/abridge', async (req, res) => {
   res.flushHeaders();
 
   try {
+    // Check for resume
+    let startIndex = 1;
+    if (resumeFrom && sessionId) {
+      const position = await SSEManager.getResumePosition(sessionId);
+      if (position && position.fromIndex > 1) {
+        startIndex = position.fromIndex;
+      }
+    }
+
     const id = sessionId || await createSession({
       mode: 'abridge', title: input?.slice(0, 50), reading_level,
       state: {},
@@ -184,7 +243,8 @@ router.post('/abridge', async (req, res) => {
     const levelGuidance = READING_LEVELS[reading_level] || READING_LEVELS.adult;
     const chunks = chunk(input, chunkSize);
 
-    send(res, 'start', { sessionId: id, total: chunks.length });
+    await SSEManager.setStreaming(id, true);
+    send(res, 'start', { sessionId: id, total: chunks.length, resumeFrom: startIndex > 1 ? startIndex : null });
 
     const { text: threadRaw } = await summarizeChain.call({ sample: input.slice(0, 2000) });
     const threads = parseThreads(threadRaw) || { characters: [], themes: [], key_events: [], tone: 'neutral' };
@@ -194,7 +254,13 @@ router.post('/abridge', async (req, res) => {
     let prevSummary = 'None.';
     const key_events = [...(threads.key_events || [])];
 
-    for (let i = 0; i < chunks.length; i++) {
+    for (let i = startIndex - 1; i < chunks.length; i++) {
+      // Check for idempotency
+      if (await SSEManager.sceneExists(id, i + 1)) {
+        send(res, 'scene', { index: i + 1, text: '[skipped - already exists]', skipped: true });
+        continue;
+      }
+
       send(res, 'progress', { scene: i + 1, total: chunks.length, status: 'summarizing' });
 
       const { text } = await summarizeChain.call({
@@ -209,20 +275,27 @@ router.post('/abridge', async (req, res) => {
       }
 
       await addScene(id, i + 1, chapterText, {}, '');
-      send(res, 'scene', { index: i + 1, text: chapterText });
+      
+      // Send with idempotency tracking
+      await SSEManager.sendEvent(res, id, 'scene', { index: i + 1, text: chapterText }, i + 1);
 
       prevSummary = text.slice(0, 400);
       key_events.push(`[chunk ${i + 1}] ${text.slice(0, 120)}...`);
     }
 
+    await SSEManager.setStreaming(id, false);
     send(res, 'done', { sessionId: id, total: chunks.length });
-  } catch (err) { send(res, 'error', { message: err.message }); }
-  finally { res.end(); }
+  } catch (err) { 
+    send(res, 'error', { message: err.message }); 
+  }
+  finally { 
+    res.end(); 
+  }
 });
 
 // POST /api/stream/adventure — streams branches as SSE
 router.post('/adventure', async (req, res) => {
-  const { input, branches = 3, initialState = {}, sessionId = null } = req.body;
+  const { input, branches = 3, initialState = {}, sessionId = null, resumeFrom = null, branchId = null } = req.body;
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -231,6 +304,15 @@ router.post('/adventure', async (req, res) => {
   res.flushHeaders();
 
   try {
+    // Check for resume
+    let startIndex = 1;
+    if (resumeFrom && sessionId) {
+      const position = await SSEManager.getResumePosition(sessionId);
+      if (position && position.fromIndex > 1) {
+        startIndex = position.fromIndex;
+      }
+    }
+
     const id = sessionId || await createSession({
       mode: 'adventure', title: input?.slice(0, 50), state: initialState,
     });
@@ -239,9 +321,16 @@ router.post('/adventure', async (req, res) => {
     const generated = [];
     const branchStates = [];
 
-    send(res, 'start', { sessionId: id, total: branches });
+    await SSEManager.setStreaming(id, true);
+    send(res, 'start', { sessionId: id, total: branches, resumeFrom: startIndex > 1 ? startIndex : null });
 
-    for (let i = 1; i <= branches; i++) {
+    for (let i = startIndex; i <= branches; i++) {
+      // Check for idempotency
+      if (await SSEManager.sceneExists(id, i, branchId)) {
+        send(res, 'scene', { index: i, text: '[skipped - already exists]', skipped: true, branch: branchId || i });
+        continue;
+      }
+
       const previousBranches = generated.length
         ? generated.map((b, idx) => `Branch ${idx + 1}:\n${b.text.slice(0, 300)}...`).join('\n\n')
         : 'None yet.';
@@ -257,15 +346,22 @@ router.post('/adventure', async (req, res) => {
         diff: 'N/A', constraints, variation: variation.instruction,
       });
 
-      await addScene(id, i, text, {}, '');
+      await addScene(id, i, text, {}, '', branchId || null);
       generated.push({ branch: i, text });
       branchStates.push(prevState);
-      send(res, 'scene', { index: i, text, branch: i });
+      
+      // Send with idempotency tracking
+      await SSEManager.sendEvent(res, id, 'scene', { index: i, text, branch: branchId || i }, i, branchId || null);
     }
 
+    await SSEManager.setStreaming(id, false);
     send(res, 'done', { sessionId: id, branches: generated });
-  } catch (err) { send(res, 'error', { message: err.message }); }
-  finally { res.end(); }
+  } catch (err) { 
+    send(res, 'error', { message: err.message }); 
+  }
+  finally { 
+    res.end(); 
+  }
 });
 
 // GET /api/session/:id — retrieve session and scenes
@@ -278,24 +374,305 @@ router.get('/session/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST /api/session/:id/scene/:index — update scene content with reconciliation
-router.post('/session/:id/scene/:index', async (req, res) => {
+// POST /api/session/:id/chapter/:index — edit chapter with constraint validation
+router.post('/session/:id/chapter/:index', async (req, res) => {
   try {
     const { id, index } = req.params;
-    const { content } = req.body;
+    const { content, expectedRevision, branchId = null } = req.body;
 
-    // Get current session to validate edit
+    // Check if session is currently streaming (edit lock)
+    if (await SSEManager.isStreaming(id)) {
+      return res.status(409).json({ 
+        error: 'Session is currently streaming. Edits are locked until generation completes.',
+        code: 'STREAMING_LOCK'
+      });
+    }
+
+    // Get current session
     const session = await getSession(id);
     if (!session) return res.status(404).json({ error: 'Session not found' });
 
-    // Run hard constraint check on the edit
-    const violations = checkHardViolations([]); // Could parse content for character deaths, etc.
-    if (violations.length) {
-      return res.status(400).json({ error: 'Edit violates constraints', violations });
+    // Get previous state from all chapters before this one
+    const previousState = await getChapterState(id, parseInt(index));
+
+    // Validate edit against constraints
+    const validation = validateEdit(content, previousState);
+    
+    if (!validation.isValid) {
+      return res.status(400).json({ 
+        success: false, 
+        violations: validation.violations
+      });
     }
 
-    await updateSceneContent(id, parseInt(index), content);
-    res.json({ ok: true });
+    // Extract state from edited content for downstream pipeline
+    const { extractState } = require('../utils/constraints');
+    const extractedState = extractState(content);
+
+    // Get chapter ID for revision history
+    const chapterId = await getChapterId(id, parseInt(index), branchId);
+    
+    // Save revision before updating
+    if (chapterId) {
+      await addRevision(chapterId, content, {});
+    }
+
+    // Update chapter content with extracted state
+    await updateSceneContent(id, parseInt(index), content, branchId, extractedState);
+
+    res.json({ 
+      success: true, 
+      chapter: { 
+        index: parseInt(index), 
+        content,
+        violations: validation.violations,
+        extractedState
+      },
+      recomputeAvailable: true // Flag to show recompute button
+    });
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
+});
+
+// POST /api/session/:id/recompute/:index — regenerate downstream chapters
+router.post('/session/:id/recompute/:index', async (req, res) => {
+  const { id, index } = req.params;
+  const { branchId = null } = req.body;
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.flushHeaders();
+
+  try {
+    // Get session and chapters
+    const session = await getSession(id);
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    const chapters = await getChapters(id, branchId);
+    const startIndex = parseInt(index);
+    
+    // Get all chapters up to and including the edited one
+    const priorChapters = chapters.filter(c => c.index < startIndex);
+    const editedChapter = chapters.find(c => c.index === startIndex);
+    
+    if (!editedChapter) {
+      return res.status(404).json({ error: 'Chapter not found' });
+    }
+
+    // Rebuild state up to this point
+    const genreProfile = getGenre(session.genre);
+    const genreRules = session.genre ? require('../config/genreProfiles').getGenreConstraints(session.genre) : '';
+    const styleGuidelines = session.author_style ? getStyleGuidelines(session.author_style) : '';
+    const constraints = buildConstraintBlock(genreProfile?.hardConstraints || []);
+    const voice = getVoiceBlock(session.protagonist);
+    const memory = new ContextWindow({ rawWindow: 3 });
+    let emotionState = applyGenreBias(emptyEmotionState(), genreProfile?.emotionBias || {});
+
+    // Load prior chapters into memory
+    for (const chapter of priorChapters) {
+      await memory.add(chapter.content);
+    }
+
+    // Get remaining chapters to regenerate
+    const remainingChapters = chapters.filter(c => c.index >= startIndex && c.index !== startIndex);
+    const totalToRegenerate = remainingChapters.length;
+
+    await SSEManager.setStreaming(id, true);
+    send(res, 'start', { 
+      sessionId: id, 
+      total: totalToRegenerate, 
+      fromIndex: startIndex,
+      mode: 'recompute' 
+    });
+
+    // Regenerate each downstream chapter
+    for (let i = 0; i < remainingChapters.length; i++) {
+      const chapter = remainingChapters[i];
+      const chapterNum = chapter.index;
+      const variation = getVariation(chapterNum);
+      
+      emotionState = updateEmotion(emotionState, variation.label);
+      const emotion = describeEmotion(emotionState);
+      const context = memory.render();
+
+      send(res, 'progress', { 
+        chapter: chapterNum + 1, 
+        total: totalToRegenerate, 
+        status: 'recomputing',
+        fromIndex: startIndex
+      });
+
+      // Generate new content
+      const { text, validation } = await generateAndValidate(sceneChain, {
+        sceneNum: chapterNum + 1, 
+        totalScenes: totalToRegenerate, 
+        context, 
+        input: session.title || '',
+        constraints, 
+        voice, 
+        genreRules, 
+        styleGuidelines,
+        variation: variation.instruction, 
+        emotion,
+      }, variation.label);
+
+      // Update in database with derived_from tracking
+      const { extractState } = require('../utils/constraints');
+      const extractedState = extractState(text);
+      await updateSceneContent(id, chapterNum, text, branchId, extractedState, startIndex);
+      
+      // Add to memory for next iteration
+      await memory.add(text);
+
+      // Send updated chapter
+      await SSEManager.sendEvent(res, id, 'chapter', { 
+        index: chapterNum, 
+        content: text, 
+        wordCount: text.split(/\s+/).length,
+        validation, 
+        emotion: emotionState,
+        recomputed: true,
+        fromIndex: startIndex
+      }, chapterNum);
+    }
+
+    await SSEManager.setStreaming(id, false);
+    send(res, 'done', { 
+      sessionId: id, 
+      recomputed: true,
+      fromIndex: startIndex,
+      totalRegenerated: totalToRegenerate
+    });
+  } catch (err) { 
+    send(res, 'error', { message: err.message }); 
+  }
+  finally { 
+    res.end(); 
+  }
+});
+
+// GET /api/session/:id/chapter/:index/revisions — get revision history
+router.get('/session/:id/chapter/:index/revisions', async (req, res) => {
+  try {
+    const { id, index } = req.params;
+    const { branchId = null } = req.query;
+
+    const chapterId = await getChapterId(id, parseInt(index), branchId || null);
+    if (!chapterId) {
+      return res.status(404).json({ error: 'Chapter not found' });
+    }
+
+    const revisions = await getRevisions(chapterId);
+    res.json({ revisions });
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
+});
+
+// POST /api/session/:id/chapter/:index/restore — restore previous revision
+router.post('/session/:id/chapter/:index/restore', async (req, res) => {
+  try {
+    const { id, index } = req.params;
+    const { revisionId, branchId = null } = req.body;
+
+    // Check if session is currently streaming (edit lock)
+    if (await SSEManager.isStreaming(id)) {
+      return res.status(409).json({ 
+        error: 'Session is currently streaming. Restore is locked until generation completes.',
+        code: 'STREAMING_LOCK'
+      });
+    }
+
+    // Get revision
+    const chapterId = await getChapterId(id, parseInt(index), branchId || null);
+    if (!chapterId) {
+      return res.status(404).json({ error: 'Chapter not found' });
+    }
+
+    const revisions = await getRevisions(chapterId);
+    const revision = revisions.find(r => r.id === revisionId);
+    
+    if (!revision) {
+      return res.status(404).json({ error: 'Revision not found' });
+    }
+
+    // Save current as revision before restoring
+    const currentChapter = await getChapter(id, parseInt(index), branchId || null);
+    if (currentChapter) {
+      await addRevision(chapterId, currentChapter.content, currentChapter.emotion);
+    }
+
+    // Restore the revision
+    await updateSceneContent(id, parseInt(index), revision.content, branchId);
+
+    res.json({ 
+      success: true, 
+      chapter: { 
+        index: parseInt(index), 
+        content: revision.content 
+      }
+    });
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
+});
+
+// Legacy endpoint for scene edits (backward compatibility)
+router.post('/session/:id/scene/:index', async (req, res) => {
+  try {
+    const { id, index } = req.params;
+    const { content, expectedRevision, branchId = null } = req.body;
+
+    // Check if session is currently streaming (edit lock)
+    if (await SSEManager.isStreaming(id)) {
+      return res.status(409).json({ 
+        error: 'Session is currently streaming. Edits are locked until generation completes.',
+        code: 'STREAMING_LOCK'
+      });
+    }
+
+    // Get current session
+    const session = await getSession(id);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+
+    // Get previous state
+    const previousState = await getChapterState(id, parseInt(index));
+
+    // Validate edit against constraints
+    const validation = validateEdit(content, previousState);
+    
+    if (!validation.isValid) {
+      return res.status(400).json({ 
+        success: false, 
+        violations: validation.violations
+      });
+    }
+
+    // Get chapter ID for revision history
+    const chapterId = await getChapterId(id, parseInt(index), branchId);
+    
+    // Save revision before updating
+    if (chapterId) {
+      await addRevision(chapterId, content, {});
+    }
+
+    // Update scene content
+    await updateSceneContent(id, parseInt(index), content, branchId);
+    
+    res.json({ 
+      success: true, 
+      scene: { 
+        index: parseInt(index), 
+        content,
+        violations: validation.violations
+      },
+      recomputeAvailable: true
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
