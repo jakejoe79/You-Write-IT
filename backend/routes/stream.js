@@ -9,11 +9,13 @@ const { ContextWindow } = require('../services/core/memoryCompressor');
 const { getVoiceBlock } = require('../characters/voiceProfiles');
 const { generateAndValidate } = require('../services/agents/sceneValidator');
 const { checkContinuity } = require('../services/agents/continuity');
+const { createSession, addScene, updateSessionState } = require('../db/sqlite');
 const { LLMChain } = require('langchain/chains');
 const { PromptTemplate } = require('@langchain/core/prompts');
 const { llm } = require('../services/core/llm');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const writerPrompt = fs.readFileSync(
   path.resolve(__dirname, '../../prompts/writer.txt'), 'utf8'
@@ -37,16 +39,15 @@ Write scene {sceneNum}:
   `.trim()),
 });
 
-// SSE helper
 function send(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-// POST /api/stream/story — streams scenes as SSE
+// POST /api/stream/story — streams scenes as SSE with session persistence
 router.post('/story', async (req, res) => {
   const {
     input, scenes = 3, genre = null, authorStyle = null,
-    protagonist = null,
+    protagonist = null, sessionId = null,
   } = req.body;
 
   res.setHeader('Content-Type', 'text/event-stream');
@@ -56,6 +57,12 @@ router.post('/story', async (req, res) => {
   res.flushHeaders();
 
   try {
+    // Create or reuse session
+    const id = sessionId || await createSession({
+      mode: 'story', title: input?.slice(0, 50), genre, authorStyle, protagonist,
+      state: { characters: {}, inventory: [], choices_made: [], world_rules: [] },
+    });
+
     const genreProfile    = getGenre(genre);
     const genreRules      = genre ? require('../config/genreProfiles').getGenreConstraints(genre) : '';
     const styleGuidelines = authorStyle ? getStyleGuidelines(authorStyle) : '';
@@ -65,7 +72,7 @@ router.post('/story', async (req, res) => {
     let emotionState      = applyGenreBias(emptyEmotionState(), genreProfile.emotionBias || {});
     const rawScenes       = [];
 
-    send(res, 'start', { total: scenes });
+    send(res, 'start', { sessionId: id, total: scenes });
 
     for (let i = 1; i <= scenes; i++) {
       const variation = getVariation(i - 1);
@@ -85,17 +92,46 @@ router.post('/story', async (req, res) => {
       rawScenes.push(text);
       await memory.add(text);
 
+      // Persist scene
+      await addScene(id, i, text, emotionState, validation);
       send(res, 'scene', { index: i, text, validation, emotion: emotionState });
     }
 
     send(res, 'progress', { status: 'checking continuity' });
     const { corrected, report } = await checkContinuity(rawScenes);
 
-    send(res, 'done', { scenes: corrected, continuityReport: report });
+    // Update session state with final emotion
+    await updateSessionState(id, { protagonist: emotionState.protagonist });
+
+    send(res, 'done', { sessionId: id, scenes: corrected, continuityReport: report });
   } catch (err) {
     send(res, 'error', { message: err.message });
   } finally {
     res.end();
+  }
+});
+
+// GET /api/session/:id — retrieve session and scenes
+router.get('/session/:id', async (req, res) => {
+  try {
+    const session = await require('../db/sqlite').getSession(req.params.id);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+    const scenes = await require('../db/sqlite').getScenes(req.params.id);
+    res.json({ session, scenes });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/session/:id/scene/:index — update scene content (user edits)
+router.post('/session/:id/scene/:index', async (req, res) => {
+  try {
+    const { id, index } = req.params;
+    const { content } = req.body;
+    await require('../db/sqlite').updateSceneContent(id, parseInt(index), content);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
